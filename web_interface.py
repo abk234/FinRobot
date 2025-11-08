@@ -195,12 +195,13 @@ def analyze():
                 "error": f"Config file {config_file} not found"
             })
         
-        # Configure LLM
+        # Configure LLM using new API (replaces deprecated config_list_from_json)
+        llm_config_obj = autogen.LLMConfig.from_json(
+            path=config_file,
+            filter_dict={"model": model_filter},
+        )
         llm_config = {
-            "config_list": autogen.config_list_from_json(
-                config_file,
-                filter_dict={"model": model_filter},
-            ),
+            "config_list": llm_config_obj.config_list,
             "timeout": 120,
             "temperature": 0,
         }

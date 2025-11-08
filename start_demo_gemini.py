@@ -70,11 +70,13 @@ def main():
             print("  3. Or create the file with your Gemini API key")
             return
         
+        # Use new LLMConfig API (replaces deprecated config_list_from_json)
+        llm_config_obj = autogen.LLMConfig.from_json(
+            path=config_file,
+            filter_dict={"model": ["gemini-2.5-flash"]},  # Use flash for faster responses
+        )
         llm_config = {
-            "config_list": autogen.config_list_from_json(
-                config_file,
-                filter_dict={"model": ["gemini-2.5-flash"]},  # Use flash for faster responses
-            ),
+            "config_list": llm_config_obj.config_list,
             "timeout": 120,
             "temperature": 0,
         }

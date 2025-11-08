@@ -61,11 +61,13 @@ def main():
     
     # Configure LLM
     try:
+        # Use new LLMConfig API (replaces deprecated config_list_from_json)
+        llm_config_obj = autogen.LLMConfig.from_json(
+            path="OAI_CONFIG_LIST",
+            filter_dict={"model": ["gpt-4o"]},
+        )
         llm_config = {
-            "config_list": autogen.config_list_from_json(
-                "OAI_CONFIG_LIST",
-                filter_dict={"model": ["gpt-4o"]},
-            ),
+            "config_list": llm_config_obj.config_list,
             "timeout": 120,
             "temperature": 0,
         }
