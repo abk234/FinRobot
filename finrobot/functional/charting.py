@@ -46,10 +46,23 @@ class MplFinanceUtils:
         Plot a stock price chart using mplfinance for the specified stock and time period,
         and save the plot to a file.
         """
-        # Fetch historical data
-        stock_data = YFinanceUtils.get_stock_data(ticker_symbol, start_date, end_date)
-        if verbose:
-            print(stock_data.to_string())
+        # Fetch historical data with error handling
+        try:
+            stock_data = YFinanceUtils.get_stock_data(ticker_symbol, start_date, end_date)
+            if stock_data.empty:
+                raise ValueError(f"No data available for {ticker_symbol}")
+            if verbose:
+                print(stock_data.to_string())
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                raise Exception(
+                    f"Yahoo Finance API Error: Unable to fetch data for {ticker_symbol}. "
+                    "This may be due to rate limiting or API restrictions. "
+                    "Please wait a few minutes and try again."
+                )
+            else:
+                raise Exception(f"Error fetching stock data for {ticker_symbol}: {error_msg}")
 
         params = {
             "type": type,

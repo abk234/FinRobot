@@ -319,12 +319,42 @@ class TradingStrategyAnalyzer:
         - Optimal entry timing based on technical indicators
         """
         try:
-            # Fetch stock data
+            # Fetch stock data with error handling and retry
             ticker = yf.Ticker(ticker_symbol)
-            data = ticker.history(period=period)
             
-            if data.empty:
-                return f"Error: No data available for {ticker_symbol}"
+            # Try to fetch data with retry logic
+            max_retries = 3
+            data = None
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    data = ticker.history(period=period)
+                    if not data.empty:
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    continue
+            
+            if data is None or data.empty:
+                error_msg = f"Error: Unable to fetch data for {ticker_symbol}"
+                if last_error:
+                    if "401" in last_error or "Unauthorized" in last_error:
+                        error_msg += "\n\n⚠️ Yahoo Finance API Error: Access denied. This may be due to:\n"
+                        error_msg += "  • Rate limiting (too many requests)\n"
+                        error_msg += "  • Yahoo Finance API restrictions\n"
+                        error_msg += "  • Network/authentication issues\n\n"
+                        error_msg += "💡 Solutions:\n"
+                        error_msg += "  • Wait a few minutes and try again\n"
+                        error_msg += "  • Check your internet connection\n"
+                        error_msg += "  • Try a different ticker symbol\n"
+                        error_msg += "  • Consider using an alternative data source"
+                    else:
+                        error_msg += f"\n\nTechnical error: {last_error}"
+                return error_msg
             
             # Calculate technical indicators
             current_price = data['Close'].iloc[-1]
@@ -674,12 +704,34 @@ class TradingStrategyAnalyzer:
         Returns performance metrics and trade statistics.
         """
         try:
-            # Fetch historical data
+            # Fetch historical data with error handling and retry
             ticker = yf.Ticker(ticker_symbol)
-            data = ticker.history(start=start_date, end=end_date)
             
-            if data.empty:
-                return f"Error: No data available for {ticker_symbol} from {start_date} to {end_date}"
+            # Try to fetch data with retry logic
+            max_retries = 3
+            data = None
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    data = ticker.history(start=start_date, end=end_date)
+                    if not data.empty:
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+            
+            if data is None or data.empty:
+                error_msg = f"Error: Unable to fetch data for {ticker_symbol} from {start_date} to {end_date}"
+                if last_error:
+                    if "401" in last_error or "Unauthorized" in last_error:
+                        error_msg += "\n\n⚠️ Yahoo Finance API Error: Access denied. Please wait a few minutes and try again."
+                    else:
+                        error_msg += f"\n\nTechnical error: {last_error}"
+                return error_msg
             
             # Initialize tracking variables
             position = None  # None, 'long', or 'short'
@@ -999,13 +1051,17 @@ class TradingStrategyAnalyzer:
                 risk_per_trade_pct=risk_per_trade_pct
             )
             
-            # Get stock info for forecasts
-            ticker = yf.Ticker(ticker_symbol)
+            # Get stock info for forecasts with error handling
             try:
+                ticker = yf.Ticker(ticker_symbol)
                 info = ticker.info
                 company_name = info.get('longName', ticker_symbol) if info else ticker_symbol
-            except:
+            except Exception as e:
+                # If we can't get company info, just use ticker symbol
                 company_name = ticker_symbol
+                # Log error but don't fail the analysis
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    pass  # Silent fail for 401 errors on info fetch
             
             # Calculate price forecast
             risk = entry_price - stop_loss

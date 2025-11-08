@@ -9,20 +9,110 @@ Run this script and open http://localhost:8250 in your browser
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, send_from_directory, make_response
 import autogen
 from finrobot.agents.workflow import SingleAssistant
 from finrobot.utils import get_current_date, register_keys_from_json
 from finrobot.functional.quantitative import TradingStrategyAnalyzer
+from finrobot.agents.trading_chat_agent import create_trading_chat_agent, process_chat_message
+from finrobot.functional.charting import MplFinanceUtils
 import os
+import uuid
+import re
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # For session management
+
+# Session storage (in-memory dict for simplicity)
+# In production, consider using Redis or database
+sessions = {}
 
 # Load API keys
 try:
     register_keys_from_json("config_api_keys")
 except:
     pass
+
+# Create static/charts directory if it doesn't exist
+CHARTS_DIR = os.path.join(os.path.dirname(__file__), 'static', 'charts')
+os.makedirs(CHARTS_DIR, exist_ok=True)
+
+def get_or_create_session(session_id=None):
+    """Get existing session or create a new one."""
+    if session_id and session_id in sessions:
+        return sessions[session_id]
+    
+    new_session_id = str(uuid.uuid4())
+    sessions[new_session_id] = {
+        "session_id": new_session_id,
+        "ticker": None,
+        "analysis_params": {},
+        "last_analysis": "",
+        "conversation_history": [],
+        "agent_context": {},
+        "created_at": datetime.now()
+    }
+    return sessions[new_session_id]
+
+def cleanup_old_sessions():
+    """Remove sessions older than 24 hours."""
+    cutoff = datetime.now() - timedelta(hours=24)
+    to_remove = [sid for sid, session in sessions.items() 
+                 if session.get("created_at", datetime.now()) < cutoff]
+    for sid in to_remove:
+        del sessions[sid]
+
+def generate_chart(ticker, period="6mo", chart_type="candle", mav=None):
+    """Generate a trading chart and return the URL."""
+    try:
+        from finrobot.data_source.yfinance_utils import YFinanceUtils
+        import yfinance as yf
+        import time
+        
+        # Calculate date range from period
+        end_date = datetime.now()
+        period_map = {
+            "1mo": timedelta(days=30),
+            "3mo": timedelta(days=90),
+            "6mo": timedelta(days=180),
+            "1y": timedelta(days=365),
+            "2y": timedelta(days=730)
+        }
+        start_date = end_date - period_map.get(period, timedelta(days=180))
+        
+        # Generate unique filename
+        chart_filename = f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        chart_path = os.path.join(CHARTS_DIR, chart_filename)
+        
+        # Try to generate chart with retry logic
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                MplFinanceUtils.plot_stock_price_chart(
+                    ticker_symbol=ticker,
+                    start_date=start_date.strftime('%Y-%m-%d'),
+                    end_date=end_date.strftime('%Y-%m-%d'),
+                    save_path=chart_path,
+                    type=chart_type,
+                    mav=mav,
+                    style="default"
+                )
+                return f"/static/charts/{chart_filename}"
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    if attempt < max_retries - 1:
+                        time.sleep(3)  # Wait before retry
+                        continue
+                    else:
+                        return None  # Return None on persistent 401 errors
+                else:
+                    raise  # Re-raise other errors
+        return None
+    except Exception as e:
+        # Log error but don't crash
+        print(f"Chart generation error: {str(e)}")
+        return None
 
 # HTML Template
 HTML_TEMPLATE = """
@@ -33,16 +123,26 @@ HTML_TEMPLATE = """
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
             padding: 20px;
             background: #f5f5f5;
+        }
+        .main-wrapper {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
         }
         .container {
             background: white;
             padding: 30px;
             border-radius: 10px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            flex: 1;
+            min-width: 0;
+        }
+        .container.full-width {
+            flex: 1 1 100%;
         }
         h1 {
             color: #2c3e50;
@@ -88,6 +188,13 @@ HTML_TEMPLATE = """
             border-radius: 5px;
             white-space: pre-wrap;
             font-family: monospace;
+            display: block !important;
+            visibility: visible !important;
+            min-height: 50px;
+        }
+        #result {
+            display: block !important;
+            visibility: visible !important;
         }
         .loading {
             text-align: center;
@@ -122,6 +229,195 @@ HTML_TEMPLATE = """
             font-size: 12px;
             line-height: 1.4;
         }
+        /* Chat Panel Styles */
+        .chat-toggle-btn {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #27ae60;
+            color: white;
+            border: none;
+            padding: 15px 20px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 16px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            z-index: 1000;
+            display: block;
+            transition: all 0.3s ease;
+        }
+        .chat-toggle-btn:hover {
+            background: #229954;
+            transform: scale(1.05);
+        }
+        .chat-toggle-btn:active {
+            transform: scale(0.95);
+        }
+        .chat-toggle-btn.has-session {
+            background: #3498db;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            50% { box-shadow: 0 4px 12px rgba(52, 152, 219, 0.5); }
+        }
+        .chat-panel {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            width: 400px;
+            display: none;
+            flex-direction: column;
+            height: 600px;
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            z-index: 999;
+            transition: opacity 0.3s ease;
+        }
+        .chat-panel.active {
+            display: flex !important;
+            opacity: 1;
+        }
+        .chat-header {
+            background: #3498db;
+            color: white;
+            padding: 15px;
+            border-radius: 10px 10px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .chat-header h3 {
+            margin: 0;
+            font-size: 18px;
+        }
+        .chat-close-btn {
+            background: transparent;
+            border: none;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            line-height: 30px;
+        }
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            background: #f8f9fa;
+        }
+        .chat-message {
+            margin-bottom: 15px;
+            padding: 12px 15px;
+            border-radius: 12px;
+            max-width: 85%;
+            word-wrap: break-word;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            line-height: 1.5;
+        }
+        .chat-message.user {
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+            color: white;
+            margin-left: auto;
+            text-align: left;
+            border-bottom-right-radius: 4px;
+        }
+        .chat-message.assistant {
+            background: #ffffff;
+            color: #2c3e50;
+            border: 1px solid #e0e0e0;
+            border-bottom-left-radius: 4px;
+        }
+        .chat-message.error {
+            background: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
+            border-bottom-left-radius: 4px;
+        }
+        .chat-message.loading {
+            background: #f8f9fa;
+            color: #7f8c8d;
+            font-style: italic;
+            border: 1px solid #e0e0e0;
+        }
+        .chat-message img {
+            max-width: 100%;
+            border-radius: 8px;
+            margin-top: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            display: block;
+        }
+        .chat-message .chart-container {
+            margin-top: 10px;
+            text-align: center;
+        }
+        .chat-message .chart-container img {
+            max-width: 100%;
+            height: auto;
+        }
+        .chat-input-area {
+            padding: 15px;
+            border-top: 1px solid #ddd;
+            display: flex;
+            gap: 10px;
+        }
+        .chat-input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .chat-send-btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .chat-send-btn:hover {
+            background: #2980b9;
+        }
+        .chat-send-btn:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        .param-confirmation {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        .param-confirmation h4 {
+            margin-top: 0;
+            color: #856404;
+        }
+        .param-confirmation-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .param-confirm-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .param-reject-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
         .toggle-info {
             background: #16a085;
             color: white;
@@ -141,7 +437,8 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="main-wrapper">
+    <div class="container" id="mainContainer">
         <h1>🤖 FinRobot - Market Analyst</h1>
         
         <button type="button" class="toggle-info" onclick="toggleInfo()">
@@ -247,7 +544,7 @@ HTML_TEMPLATE = """
             </ul>
         </div>
         
-        <form id="analysisForm">
+        <form id="analysisForm" onsubmit="event.preventDefault(); event.stopPropagation(); handleFormSubmit(event); return false;">
             <div class="form-group">
                 <label for="ticker">Stock Ticker Symbol:</label>
                 <input type="text" id="ticker" name="ticker" value="AAPL" required>
@@ -394,81 +691,99 @@ HTML_TEMPLATE = """
         
         <div id="result"></div>
     </div>
+    </div>
+    
+    <!-- Chat functionality temporarily disabled -->
+    <!-- Chat Toggle Button -->
+    <!-- <button class="chat-toggle-btn" id="chatToggleBtn" onclick="toggleChatPanel()">
+        💬 Chat with Analyst
+    </button> -->
+    
+    <!-- Chat Panel -->
+    <!-- <div class="chat-panel" id="chatPanel">
+        <div class="chat-header">
+            <h3>💬 Trading Analyst Chat</h3>
+            <button class="chat-close-btn" onclick="toggleChatPanel()">×</button>
+        </div>
+        <div class="chat-messages" id="chatMessages">
+            <div class="chat-message assistant">
+                👋 Hello! I'm your Trading Analyst Assistant. After you run an analysis, I can help you understand the results, explain technical indicators, generate charts, and answer any questions you have!
+            </div>
+        </div>
+        <div class="chat-input-area">
+            <input type="text" class="chat-input" id="chatInput" placeholder="Ask me anything about the analysis..." onkeypress="handleChatKeyPress(event)" oninput="validateChatInput()">
+            <button class="chat-send-btn" id="chatSendBtn" onclick="sendChatMessage()" disabled>Send</button>
+        </div>
+    </div> -->
     
     <script>
-        // Toggle indicator info panel
-        function toggleInfo() {
-            const infoPanel = document.getElementById('indicatorInfo');
-            if (infoPanel.style.display === 'none' || infoPanel.style.display === '') {
-                infoPanel.style.display = 'block';
-            } else {
-                infoPanel.style.display = 'none';
-            }
-        }
+        let currentSessionId = null;
         
-        // Toggle trading parameters based on analysis type
-        document.getElementById('analysisType').addEventListener('change', function() {
-            const analysisType = this.value;
-            const queryGroup = document.getElementById('queryGroup');
-            const tradingParams = document.getElementById('tradingParams');
-            const comprehensiveParams = document.getElementById('comprehensiveParams');
-            
-            if (analysisType === 'trading') {
-                queryGroup.style.display = 'none';
-                tradingParams.style.display = 'block';
-                comprehensiveParams.style.display = 'none';
-            } else if (analysisType === 'comprehensive') {
-                queryGroup.style.display = 'none';
-                tradingParams.style.display = 'none';
-                comprehensiveParams.style.display = 'block';
-            } else {
-                queryGroup.style.display = 'block';
-                tradingParams.style.display = 'none';
-                comprehensiveParams.style.display = 'none';
-            }
-        });
-        
-        document.getElementById('analysisForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const submitBtn = document.getElementById('submitBtn');
-            const resultDiv = document.getElementById('result');
-            const analysisType = document.getElementById('analysisType').value;
-            
-            submitBtn.disabled = true;
-            resultDiv.innerHTML = '<div class="loading">⏳ Analyzing... This may take a minute.</div>';
-            
-            const formData = {
-                ticker: document.getElementById('ticker').value,
-                model: document.getElementById('model').value,
-                analysisType: analysisType
-            };
-            
-            if (analysisType === 'market') {
-                formData.query = document.getElementById('query').value;
-            } else if (analysisType === 'trading') {
-                formData.riskReward = parseFloat(document.getElementById('riskReward').value);
-                formData.stopLossMethod = document.getElementById('stopLossMethod').value;
-                formData.period = document.getElementById('period').value;
-                formData.stopLossPct = parseFloat(document.getElementById('stopLossPct').value);
-                formData.runBacktest = document.getElementById('runBacktest').checked;
-            } else if (analysisType === 'comprehensive') {
-                formData.riskReward = parseFloat(document.getElementById('compRiskReward').value);
-                formData.stopLossMethod = document.getElementById('compStopLossMethod').value;
-                formData.period = document.getElementById('compPeriod').value;
-                formData.stopLossPct = parseFloat(document.getElementById('compStopLossPct').value);
-                formData.accountValue = parseFloat(document.getElementById('accountValue').value);
-                formData.riskPerTrade = parseFloat(document.getElementById('riskPerTrade').value);
-                formData.includeResearch = document.getElementById('includeResearch').checked;
-            }
-            
+        // Form submission handler - defined early to be available for inline handler
+        async function handleFormSubmit(e) {
             try {
+                if (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+                console.log('Form submitted!');
+                
+                const submitBtn = document.getElementById('submitBtn');
+                const resultDiv = document.getElementById('result');
+                const analysisType = document.getElementById('analysisType').value;
+                
+                // Validate form
+                if (!resultDiv) {
+                    console.error('Result div not found!');
+                    alert('Error: Result container not found. Please refresh the page.');
+                    return false;
+                }
+                
+                if (!submitBtn) {
+                    console.error('Submit button not found!');
+                    return false;
+                }
+                
+                submitBtn.disabled = true;
+                resultDiv.style.display = 'block';
+                resultDiv.style.visibility = 'visible';
+                resultDiv.innerHTML = '<div class="loading">⏳ Analyzing... This may take a minute.</div>';
+                
+                console.log('Starting analysis with type:', analysisType);
+                
+                const formData = {
+                    ticker: document.getElementById('ticker').value,
+                    model: document.getElementById('model').value,
+                    analysisType: analysisType
+                };
+                
+                if (analysisType === 'market') {
+                    formData.query = document.getElementById('query').value;
+                } else if (analysisType === 'trading') {
+                    formData.riskReward = parseFloat(document.getElementById('riskReward').value);
+                    formData.stopLossMethod = document.getElementById('stopLossMethod').value;
+                    formData.period = document.getElementById('period').value;
+                    formData.stopLossPct = parseFloat(document.getElementById('stopLossPct').value);
+                    formData.runBacktest = document.getElementById('runBacktest').checked;
+                } else if (analysisType === 'comprehensive') {
+                    formData.riskReward = parseFloat(document.getElementById('compRiskReward').value);
+                    formData.stopLossMethod = document.getElementById('compStopLossMethod').value;
+                    formData.period = document.getElementById('compPeriod').value;
+                    formData.stopLossPct = parseFloat(document.getElementById('compStopLossPct').value);
+                    formData.accountValue = parseFloat(document.getElementById('accountValue').value);
+                    formData.riskPerTrade = parseFloat(document.getElementById('riskPerTrade').value);
+                    formData.includeResearch = document.getElementById('includeResearch').checked;
+                }
+                
                 let endpoint = '/analyze';
                 if (analysisType === 'trading') {
                     endpoint = '/trading-strategy';
                 } else if (analysisType === 'comprehensive') {
                     endpoint = '/comprehensive-analysis';
                 }
+                
+                console.log('Sending request to:', endpoint, 'with data:', formData);
+                
                 const response = await fetch(endpoint, {
                     method: 'POST',
                     headers: {
@@ -477,19 +792,167 @@ HTML_TEMPLATE = """
                     body: JSON.stringify(formData)
                 });
                 
+                console.log('Response status:', response.status);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
                 const data = await response.json();
+                console.log('Response data:', data);
                 
                 if (data.success) {
-                    resultDiv.innerHTML = '<div class="result">' + data.result + '</div>';
+                    // Ensure result div is visible and display results
+                    resultDiv.style.display = 'block';
+                    resultDiv.style.visibility = 'visible';
+                    resultDiv.innerHTML = '<div class="result">' + escapeHtml(data.result) + '</div>';
+                    
+                    // Scroll to results
+                    resultDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    
+                    // Chat functionality temporarily disabled - focus on getting analysis working first
+                    // if (data.session_id) {
+                    //     currentSessionId = data.session_id;
+                    //     console.log('Session initialized:', currentSessionId);
+                    // }
                 } else {
-                    resultDiv.innerHTML = '<div class="error">Error: ' + data.error + '</div>';
+                    resultDiv.style.display = 'block';
+                    resultDiv.style.visibility = 'visible';
+                    resultDiv.innerHTML = '<div class="error">Error: ' + escapeHtml(data.error || 'Unknown error') + '</div>';
                 }
             } catch (error) {
-                resultDiv.innerHTML = '<div class="error">Error: ' + error.message + '</div>';
+                const resultDiv = document.getElementById('result');
+                if (resultDiv) {
+                    resultDiv.style.display = 'block';
+                    resultDiv.style.visibility = 'visible';
+                    resultDiv.innerHTML = '<div class="error">Error: ' + escapeHtml(error.message || 'Network error occurred') + '</div>';
+                }
+                console.error('Analysis error:', error);
             } finally {
-                submitBtn.disabled = false;
+                const submitBtn = document.getElementById('submitBtn');
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                }
             }
+            return false;
+        }
+        
+        // Make handleFormSubmit globally accessible immediately
+        window.handleFormSubmit = handleFormSubmit;
+        
+        // Chat functions temporarily disabled - focus on getting analysis working first
+        // function validateChatInput() {
+        //     const input = document.getElementById('chatInput');
+        //     const sendBtn = document.getElementById('chatSendBtn');
+        //     const message = input.value.trim();
+        //     
+        //     // Enable/disable send button based on whether there's content
+        //     if (message.length > 0 && currentSessionId) {
+        //         sendBtn.disabled = false;
+        //     } else {
+        //         sendBtn.disabled = true;
+        //     }
+        // }
+        
+        // Toggle indicator info panel
+        function toggleInfo() {
+            const infoPanel = document.getElementById('indicatorInfo');
+            if (infoPanel) {
+                if (infoPanel.style.display === 'none' || infoPanel.style.display === '') {
+                    infoPanel.style.display = 'block';
+                } else {
+                    infoPanel.style.display = 'none';
+                }
+            }
+        }
+        
+        // Make toggleInfo globally accessible
+        window.toggleInfo = toggleInfo;
+        
+        
+        // Toggle trading parameters based on analysis type
+        function setupEventListeners() {
+            const analysisTypeEl = document.getElementById('analysisType');
+            const analysisFormEl = document.getElementById('analysisForm');
+            
+            if (!analysisTypeEl || !analysisFormEl) {
+                console.error('Required form elements not found!');
+                return;
+            }
+            
+            analysisTypeEl.addEventListener('change', function() {
+                const analysisType = this.value;
+                const queryGroup = document.getElementById('queryGroup');
+                const tradingParams = document.getElementById('tradingParams');
+                const comprehensiveParams = document.getElementById('comprehensiveParams');
+                const resultDiv = document.getElementById('result');
+                
+                // Clear previous results when changing analysis type
+                if (resultDiv) {
+                    resultDiv.innerHTML = '';
+                }
+                
+                if (analysisType === 'trading') {
+                    queryGroup.style.display = 'none';
+                    tradingParams.style.display = 'block';
+                    comprehensiveParams.style.display = 'none';
+                } else if (analysisType === 'comprehensive') {
+                    queryGroup.style.display = 'none';
+                    tradingParams.style.display = 'none';
+                    comprehensiveParams.style.display = 'block';
+                } else {
+                    queryGroup.style.display = 'block';
+                    tradingParams.style.display = 'none';
+                    comprehensiveParams.style.display = 'none';
+                }
+            });
+            
+            // Attach form submit handler (backup, inline handler should work)
+            analysisFormEl.addEventListener('submit', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                handleFormSubmit(e);
+            });
+            console.log('Form event listener attached');
+        }
+        
+        // Initialize form state on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Setup event listeners
+            setupEventListeners();
+            // Set initial form state based on selected analysis type
+            const analysisType = document.getElementById('analysisType');
+            if (analysisType) {
+                analysisType.dispatchEvent(new Event('change'));
+            }
+            
+            // Ensure result div is visible
+            const resultDiv = document.getElementById('result');
+            if (resultDiv) {
+                resultDiv.style.display = 'block';
+                resultDiv.style.visibility = 'visible';
+            }
+            
+            // Chat functionality temporarily disabled
+            // const chatToggleBtn = document.getElementById('chatToggleBtn');
         });
+        
+        // Also try to setup listeners immediately (in case DOM is already loaded)
+        if (document.readyState === 'loading') {
+            // DOM is still loading, wait for DOMContentLoaded
+        } else {
+            // DOM is already loaded, setup immediately
+            setupEventListeners();
+        }
+        
+        // Chat Functions - temporarily disabled
+        // All chat-related functions commented out to focus on getting analysis working first
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
     </script>
 </body>
 </html>
@@ -497,7 +960,12 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    response = make_response(render_template_string(HTML_TEMPLATE))
+    # Disable caching to ensure fresh content
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -771,9 +1239,232 @@ def comprehensive_analysis():
             company_research=company_research
         )
         
+        # Initialize or update session
+        session = get_or_create_session()
+        session["ticker"] = ticker
+        session["analysis_params"] = {
+            "risk_reward": risk_reward,
+            "stop_loss_method": stop_loss_method,
+            "period": period,
+            "stop_loss_pct": stop_loss_pct,
+            "account_value": account_value,
+            "risk_per_trade": risk_per_trade
+        }
+        session["last_analysis"] = result
+        session["conversation_history"] = []
+        
         return jsonify({
             "success": True,
-            "result": result
+            "result": result,
+            "session_id": session["session_id"]
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        })
+
+@app.route('/static/charts/<path:filename>')
+def serve_chart(filename):
+    """Serve generated charts."""
+    try:
+        # Ensure the file exists
+        file_path = os.path.join(CHARTS_DIR, filename)
+        if not os.path.exists(file_path):
+            return jsonify({"error": "Chart not found"}), 404
+        return send_from_directory(CHARTS_DIR, filename)
+    except Exception as e:
+        # Return 404 if chart not found
+        return jsonify({"error": f"Chart not found: {str(e)}"}), 404
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat messages from the trading agent."""
+    try:
+        cleanup_old_sessions()  # Clean up old sessions periodically
+        
+        data = request.json
+        session_id = data.get('session_id')
+        message = data.get('message', '')
+        
+        if not session_id or session_id not in sessions:
+            return jsonify({
+                "success": False,
+                "error": "Invalid or expired session. Please run an analysis first."
+            })
+        
+        session = sessions[session_id]
+        
+        if not session.get('ticker'):
+            return jsonify({
+                "success": False,
+                "error": "No analysis found in session. Please run an analysis first."
+            })
+        
+        # Add user message to conversation history
+        session["conversation_history"].append({"role": "user", "content": message})
+        
+        # Get model type (default to gemini)
+        model_type = "gemini"  # Could be stored in session if needed
+        config_file = "GEMINI_CONFIG_LIST" if model_type == "gemini" else "OAI_CONFIG_LIST"
+        model_filter = ["gemini-2.5-flash"] if model_type == "gemini" else ["gpt-4o"]
+        
+        if not os.path.exists(config_file):
+            return jsonify({
+                "success": False,
+                "error": f"Config file {config_file} not found"
+            })
+        
+        # Configure LLM
+        llm_config_obj = autogen.LLMConfig.from_json(
+            path=config_file,
+            filter_dict={"model": model_filter},
+        )
+        llm_config = {
+            "config_list": llm_config_obj.config_list,
+            "timeout": 120,
+            "temperature": 0.7,  # Slightly higher for more conversational responses
+        }
+        
+        # Initialize agent_context if not exists
+        if "agent_context" not in session:
+            session["agent_context"] = {}
+        
+        # Create or reuse trading chat agent
+        if "agent" not in session["agent_context"]:
+            agent = create_trading_chat_agent(
+                llm_config=llm_config,
+                ticker=session["ticker"],
+                analysis_params=session["analysis_params"],
+                last_analysis=session["last_analysis"][:1000],  # First 1000 chars for context
+                conversation_history=session["conversation_history"][-10:]  # Last 10 messages
+            )
+            session["agent_context"]["agent"] = agent
+        else:
+            agent = session["agent_context"]["agent"]
+        
+        # Process message through agent
+        response = process_chat_message(agent, message, use_cache=False)
+        
+        # Add assistant response to conversation history
+        session["conversation_history"].append({"role": "assistant", "content": response})
+        
+        # Check if response contains chart request or parameter change
+        response_type = "text"
+        chart_url = None
+        confirmation_data = None
+        
+        # Check for chart generation requests (simple pattern matching)
+        if "chart" in message.lower() or "plot" in message.lower() or "graph" in message.lower() or "show me" in message.lower():
+            # Try to generate a chart
+            try:
+                chart_url = generate_chart(
+                    ticker=session["ticker"],
+                    period=session["analysis_params"].get("period", "6mo"),
+                    chart_type="candle",
+                    mav=[20, 50]  # Default moving averages
+                )
+                if chart_url:
+                    response_type = "chart"
+                    response = "Here's the chart you requested:"
+                else:
+                    # Chart generation failed
+                    response = "I apologize, but I couldn't generate the chart at this time. This may be due to Yahoo Finance API limitations. Please try again in a few minutes."
+            except Exception as chart_error:
+                response = f"I encountered an error while generating the chart: {str(chart_error)}. Please try again later."
+        
+        # Check for parameter change suggestions (simple pattern matching - could be enhanced)
+        # This is a basic implementation - the agent should explicitly suggest changes
+        if "suggest" in response.lower() and ("risk" in response.lower() or "parameter" in response.lower()):
+            # Extract suggested changes (this is simplified - in production, use structured output)
+            confirmation_id = str(uuid.uuid4())
+            session["agent_context"]["pending_confirmations"] = session["agent_context"].get("pending_confirmations", {})
+            session["agent_context"]["pending_confirmations"][confirmation_id] = {
+                "suggestion": response,
+                "timestamp": datetime.now()
+            }
+            response_type = "parameter_confirmation"
+            confirmation_data = {
+                "confirmation_id": confirmation_id,
+                "confirmation_title": "Parameter Change Suggestion",
+                "confirmation_message": response
+            }
+        
+        result = {
+            "success": True,
+            "message": response,
+            "response_type": response_type
+        }
+        
+        if chart_url:
+            result["chart_url"] = chart_url
+        
+        if confirmation_data:
+            result.update(confirmation_data)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        })
+
+@app.route('/chat/confirm-params', methods=['POST'])
+def confirm_params():
+    """Handle parameter change confirmations."""
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        confirmation_id = data.get('confirmation_id')
+        accepted = data.get('accepted', False)
+        
+        if not session_id or session_id not in sessions:
+            return jsonify({
+                "success": False,
+                "error": "Invalid session"
+            })
+        
+        session = sessions[session_id]
+        
+        if accepted:
+            # Get pending confirmation
+            pending = session["agent_context"].get("pending_confirmations", {}).get(confirmation_id)
+            if pending:
+                # In a real implementation, parse the suggestion and update parameters
+                # For now, we'll just re-run the analysis with current parameters
+                # (In production, parse the agent's suggestion and extract new parameter values)
+                
+                # Re-run comprehensive analysis
+                result = TradingStrategyAnalyzer.comprehensive_analysis(
+                    ticker_symbol=session["ticker"],
+                    period=session["analysis_params"].get("period", "6mo"),
+                    risk_reward_ratio=session["analysis_params"].get("risk_reward", 2.0),
+                    stop_loss_method=session["analysis_params"].get("stop_loss_method", "atr"),
+                    stop_loss_percentage=session["analysis_params"].get("stop_loss_pct", 2.0),
+                    account_value=session["analysis_params"].get("account_value", 10000.0),
+                    risk_per_trade_pct=session["analysis_params"].get("risk_per_trade", 1.0),
+                    company_research=None  # Could be cached
+                )
+                
+                session["last_analysis"] = result
+                
+                # Remove confirmation
+                if confirmation_id in session["agent_context"].get("pending_confirmations", {}):
+                    del session["agent_context"]["pending_confirmations"][confirmation_id]
+                
+                return jsonify({
+                    "success": True,
+                    "updated_analysis": result
+                })
+        
+        # Remove confirmation even if rejected
+        if confirmation_id in session["agent_context"].get("pending_confirmations", {}):
+            del session["agent_context"]["pending_confirmations"][confirmation_id]
+        
+        return jsonify({
+            "success": True
         })
         
     except Exception as e:
@@ -793,6 +1484,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f"\n🌐 Starting web server on port {port}...")
     print(f"📱 Open your browser and go to: http://localhost:{port}")
-    print("🛑 Press Ctrl+C to stop the server\n")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print("🛑 Press Ctrl+C to stop the server")
+    print("💡 TIP: If you see old UI, do a hard refresh: Ctrl+Shift+R (Windows/Linux) or Cmd+Shift+R (Mac)\n")
+    app.run(host='0.0.0.0', port=port, debug=True)  # Enable debug mode for auto-reload
 

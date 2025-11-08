@@ -19,3 +19,4 @@ filings/
 venv/
 config_api_keys*.*
 config_api_keys
+static/charts/
