@@ -227,21 +227,49 @@ def analyze():
                 f"price movement for next week. Provide a summary analysis to support your prediction."
             )
         
-        # Run analysis
-        assistant.chat(message)
+        # Run analysis using initiate_chat directly so we can access messages before reset
+        from autogen.cache import Cache
         
-        # Get the result from the last message
-        messages = assistant.assistant.chat_messages[assistant.user_proxy]
-        if messages:
-            last_message = messages[-1].get("content", "Analysis completed.")
+        result_text = "Analysis completed."
+        
+        try:
+            # Use initiate_chat directly instead of chat() so we can access messages before reset
+            with Cache.disk() as cache:
+                assistant.user_proxy.initiate_chat(
+                    assistant.assistant,
+                    message=message,
+                    cache=cache,
+                )
+            
+            # Get the last message from the assistant BEFORE reset
+            # The messages are stored in assistant.assistant.chat_messages[assistant.user_proxy]
+            if assistant.assistant.chat_messages.get(assistant.user_proxy):
+                messages = assistant.assistant.chat_messages[assistant.user_proxy]
+                # Get the last message from the assistant (not user_proxy)
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant" or assistant.assistant.name in str(msg.get("name", "")):
+                        result_text = msg.get("content", "Analysis completed.")
+                        break
+                # If no assistant message found, get the last message
+                if result_text == "Analysis completed." and messages:
+                    result_text = messages[-1].get("content", "Analysis completed.")
+            
+            # Now reset (like chat() does)
+            assistant.reset()
+            
             return jsonify({
                 "success": True,
-                "result": last_message
+                "result": result_text
             })
-        else:
+        except Exception as chat_error:
+            # Reset on error too
+            try:
+                assistant.reset()
+            except:
+                pass
             return jsonify({
-                "success": True,
-                "result": "Analysis completed. Check the conversation history."
+                "success": False,
+                "error": f"Error during analysis: {str(chat_error)}"
             })
             
     except Exception as e:
